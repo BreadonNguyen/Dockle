@@ -147,6 +147,14 @@ def launch(path: str) -> None:
 
 
 _lnk_cache: dict[str, str] = {}
+_icon_cache: dict[str, QIcon] = {}
+_icon_provider_instance: QFileIconProvider | None = None   # singleton — never recreate
+
+def _get_icon_provider() -> QFileIconProvider:
+    global _icon_provider_instance
+    if _icon_provider_instance is None:
+        _icon_provider_instance = QFileIconProvider()
+    return _icon_provider_instance
 
 def _resolve_lnk(path: str) -> str:
     """Resolve a .lnk shortcut to its target so the icon has no arrow overlay."""
@@ -189,12 +197,15 @@ def _parse_lnk_binary(path: str) -> str:
     return path
 
 def file_icon(path: str) -> QIcon:
+    if path in _icon_cache:
+        return _icon_cache[path]
     resolved = _resolve_lnk(path)
-    icon = QFileIconProvider().icon(QFileInfo(resolved))
+    icon = _get_icon_provider().icon(QFileInfo(resolved))
     if icon.isNull():
-        return QApplication.style().standardIcon(
+        icon = QApplication.style().standardIcon(
             QApplication.style().StandardPixmap.SP_FileIcon
         )
+    _icon_cache[path] = icon
     return icon
 
 
@@ -1358,6 +1369,11 @@ class NowPlayingTile(QWidget):
         self._smtc_thread = None
         self._scan()
 
+        # Cache fonts used in _anim_step / paintEvent so we don't allocate every frame
+        self._title_font = QFont("Segoe UI", max(8, size // 8))
+        self._title_font.setBold(True)
+        self._title_fm = QFontMetrics(self._title_font)
+
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._anim_step)
         self._anim_timer.start(50)
@@ -1419,10 +1435,7 @@ class NowPlayingTile(QWidget):
     def _anim_step(self):
         if not self._title:
             return
-        tf = QFont("Segoe UI", max(8, self._sz // 8))
-        tf.setBold(True)
-        fm = QFontMetrics(tf)
-        text_w = fm.horizontalAdvance(self._title)
+        text_w = self._title_fm.horizontalAdvance(self._title)
         avail = self.width() - 20 - self._btn_zone
         if text_w <= avail:
             self._scroll_offset = 0
@@ -2021,6 +2034,11 @@ class StopwatchTile(QWidget):
         self._tick.timeout.connect(self._update)
         self._tick.start(80)
 
+        # Cache fonts for paintEvent so they aren't re-created every 80 ms
+        self._main_font = QFont("Segoe UI", max(13, size // 5))
+        self._main_font.setBold(True)
+        self._sub_font = QFont("Segoe UI", max(9, size // 7))
+
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._ctx)
 
@@ -2053,9 +2071,8 @@ class StopwatchTile(QWidget):
         tenth = int((self._elapsed % 1) * 10)
         sub = f".{tenth}"
 
-        tf = QFont("Segoe UI", max(13, self._sz // 5))
-        tf.setBold(True)
-        sf = QFont("Segoe UI", max(9, self._sz // 7))
+        tf  = self._main_font
+        sf  = self._sub_font
         tfm = QFontMetrics(tf)
         sfm = QFontMetrics(sf)
 
