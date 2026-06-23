@@ -148,13 +148,14 @@ def launch(path: str) -> None:
 
 _lnk_cache: dict[str, str] = {}
 _icon_cache: dict[str, QIcon] = {}
-_icon_provider_instance: QFileIconProvider | None = None   # singleton — never recreate
+_icon_provider: QFileIconProvider | None = None
+_CACHE_MAX = 256
 
 def _get_icon_provider() -> QFileIconProvider:
-    global _icon_provider_instance
-    if _icon_provider_instance is None:
-        _icon_provider_instance = QFileIconProvider()
-    return _icon_provider_instance
+    global _icon_provider
+    if _icon_provider is None:
+        _icon_provider = QFileIconProvider()
+    return _icon_provider
 
 def _resolve_lnk(path: str) -> str:
     """Resolve a .lnk shortcut to its target so the icon has no arrow overlay."""
@@ -163,6 +164,8 @@ def _resolve_lnk(path: str) -> str:
     if path in _lnk_cache:
         return _lnk_cache[path]
     target = _parse_lnk_binary(path)
+    if len(_lnk_cache) >= _CACHE_MAX:
+        _lnk_cache.pop(next(iter(_lnk_cache)))
     _lnk_cache[path] = target
     return target
 
@@ -205,6 +208,8 @@ def file_icon(path: str) -> QIcon:
         icon = QApplication.style().standardIcon(
             QApplication.style().StandardPixmap.SP_FileIcon
         )
+    if len(_icon_cache) >= _CACHE_MAX:
+        _icon_cache.pop(next(iter(_icon_cache)))
     _icon_cache[path] = icon
     return icon
 
@@ -270,32 +275,43 @@ def _set_startup(enabled: bool) -> None:
         print("startup registry failed:", e)
 
 
+# Shared buffers reused by is_desktop_active / is_fullscreen_foreign every 120 ms.
+# Never recreated — eliminates ~16 ctypes allocations/second.
+_CLS_BUF  = ctypes.create_unicode_buffer(256)
+_RECT_BUF = ctypes.wintypes.RECT()
+_FS_SW    = 0
+_FS_SH    = 0
+_FS_TICK  = -999.0
+
+
 def is_desktop_active() -> bool:
     try:
         hwnd = ctypes.windll.user32.GetForegroundWindow()
         if hwnd == 0:
             return True
-        buf = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)
-        return buf.value in ("Progman", "WorkerW", "Shell_TrayWnd", "")
+        ctypes.windll.user32.GetClassNameW(hwnd, _CLS_BUF, 256)
+        return _CLS_BUF.value in ("Progman", "WorkerW", "Shell_TrayWnd", "")
     except Exception:
         return True
 
 
 def is_fullscreen_foreign() -> bool:
+    global _FS_SW, _FS_SH, _FS_TICK
     try:
         hwnd = ctypes.windll.user32.GetForegroundWindow()
         if not hwnd:
             return False
-        cls = ctypes.create_unicode_buffer(256)
-        ctypes.windll.user32.GetClassNameW(hwnd, cls, 256)
-        if cls.value in ('Progman', 'WorkerW', 'Shell_TrayWnd', 'DV2ControlHost'):
+        ctypes.windll.user32.GetClassNameW(hwnd, _CLS_BUF, 256)
+        if _CLS_BUF.value in ('Progman', 'WorkerW', 'Shell_TrayWnd', 'DV2ControlHost'):
             return False
-        rect = ctypes.wintypes.RECT()
-        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-        sw = ctypes.windll.user32.GetSystemMetrics(0)
-        sh = ctypes.windll.user32.GetSystemMetrics(1)
-        return rect.left <= 0 and rect.top <= 0 and rect.right >= sw and rect.bottom >= sh
+        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(_RECT_BUF))
+        now = time.monotonic()
+        if now - _FS_TICK > 10.0:
+            _FS_SW   = ctypes.windll.user32.GetSystemMetrics(0)
+            _FS_SH   = ctypes.windll.user32.GetSystemMetrics(1)
+            _FS_TICK = now
+        return (_RECT_BUF.left <= 0 and _RECT_BUF.top <= 0
+                and _RECT_BUF.right >= _FS_SW and _RECT_BUF.bottom >= _FS_SH)
     except Exception:
         return False
 
@@ -927,17 +943,18 @@ class HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 
-_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+_WNDENUMPROC    = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+_WIN_TITLE_BUF  = ctypes.create_unicode_buffer(1024)
+_WIN_TITLE_MAX  = 1023
 
 def _scan_now_playing():
     # --- Spotify: query by window class so both old and new title formats work ---
     spotify_hwnd = ctypes.windll.user32.FindWindowW("SpotifyMainWindow", None)
     if spotify_hwnd and ctypes.windll.user32.IsWindowVisible(spotify_hwnd):
         length = ctypes.windll.user32.GetWindowTextLengthW(spotify_hwnd)
-        if length > 2:
-            buf = ctypes.create_unicode_buffer(length + 1)
-            ctypes.windll.user32.GetWindowTextW(spotify_hwnd, buf, length + 1)
-            title = buf.value.strip()
+        if 2 < length <= _WIN_TITLE_MAX:
+            ctypes.windll.user32.GetWindowTextW(spotify_hwnd, _WIN_TITLE_BUF, length + 1)
+            title = _WIN_TITLE_BUF.value.strip()
             # idle/paused titles to ignore
             if title and title not in ("Spotify", "Spotify Premium", "Spotify Free"):
                 if title.endswith(" - Spotify"):
@@ -952,11 +969,10 @@ def _scan_now_playing():
         if not ctypes.windll.user32.IsWindowVisible(hwnd):
             return True
         length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-        if length < 3:
+        if length < 3 or length > _WIN_TITLE_MAX:
             return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value
+        ctypes.windll.user32.GetWindowTextW(hwnd, _WIN_TITLE_BUF, length + 1)
+        title = _WIN_TITLE_BUF.value
         # YouTube Music — pipe separator (Firefox/Zen) or dash separator (Chrome/Edge)
         if "YouTube Music" in title:
             if " | YouTube Music" in title:
@@ -991,6 +1007,20 @@ try:
     _PSUTIL_OK = True
 except ImportError:
     pass
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength",                ctypes.c_ulong),
+        ("dwMemoryLoad",            ctypes.c_ulong),
+        ("ullTotalPhys",            ctypes.c_ulonglong),
+        ("ullAvailPhys",            ctypes.c_ulonglong),
+        ("ullTotalPageFile",        ctypes.c_ulonglong),
+        ("ullAvailPageFile",        ctypes.c_ulonglong),
+        ("ullTotalVirtual",         ctypes.c_ulonglong),
+        ("ullAvailVirtual",         ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
 
 
 class ClockTile(QWidget):
@@ -1081,22 +1111,14 @@ class SysInfoTile(QWidget):
         self.customContextMenuRequested.connect(self._ctx)
 
     def _tick(self):
+        if not self.isVisible():
+            return
         if _PSUTIL_OK:
             self._cpu = _psutil.cpu_percent(interval=None)
             self._ram = _psutil.virtual_memory().percent
         else:
             try:
-                class _MS(ctypes.Structure):
-                    _fields_ = [("dwLength", ctypes.c_ulong),
-                                 ("dwMemoryLoad", ctypes.c_ulong),
-                                 ("ullTotalPhys", ctypes.c_ulonglong),
-                                 ("ullAvailPhys", ctypes.c_ulonglong),
-                                 ("ullTotalPageFile", ctypes.c_ulonglong),
-                                 ("ullAvailPageFile", ctypes.c_ulonglong),
-                                 ("ullTotalVirtual", ctypes.c_ulonglong),
-                                 ("ullAvailVirtual", ctypes.c_ulonglong),
-                                 ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-                ms = _MS()
+                ms = _MEMORYSTATUSEX()
                 ms.dwLength = ctypes.sizeof(ms)
                 ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
                 self._ram = float(ms.dwMemoryLoad)
@@ -1280,6 +1302,8 @@ class VolumeTile(QWidget):
             pass
 
     def _refresh(self):
+        if not self.isVisible():
+            return
         self._vol = self.get_volume()
         self.update()
 
@@ -1369,11 +1393,6 @@ class NowPlayingTile(QWidget):
         self._smtc_thread = None
         self._scan()
 
-        # Cache fonts used in _anim_step / paintEvent so we don't allocate every frame
-        self._title_font = QFont("Segoe UI", max(8, size // 8))
-        self._title_font.setBold(True)
-        self._title_fm = QFontMetrics(self._title_font)
-
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._anim_step)
         self._anim_timer.start(50)
@@ -1435,7 +1454,10 @@ class NowPlayingTile(QWidget):
     def _anim_step(self):
         if not self._title:
             return
-        text_w = self._title_fm.horizontalAdvance(self._title)
+        tf = QFont("Segoe UI", max(8, self._sz // 8))
+        tf.setBold(True)
+        fm = QFontMetrics(tf)
+        text_w = fm.horizontalAdvance(self._title)
         avail = self.width() - 20 - self._btn_zone
         if text_w <= avail:
             self._scroll_offset = 0
@@ -2034,11 +2056,6 @@ class StopwatchTile(QWidget):
         self._tick.timeout.connect(self._update)
         self._tick.start(80)
 
-        # Cache fonts for paintEvent so they aren't re-created every 80 ms
-        self._main_font = QFont("Segoe UI", max(13, size // 5))
-        self._main_font.setBold(True)
-        self._sub_font = QFont("Segoe UI", max(9, size // 7))
-
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._ctx)
 
@@ -2071,8 +2088,9 @@ class StopwatchTile(QWidget):
         tenth = int((self._elapsed % 1) * 10)
         sub = f".{tenth}"
 
-        tf  = self._main_font
-        sf  = self._sub_font
+        tf = QFont("Segoe UI", max(13, self._sz // 5))
+        tf.setBold(True)
+        sf = QFont("Segoe UI", max(9, self._sz // 7))
         tfm = QFontMetrics(tf)
         sfm = QFontMetrics(sf)
 
@@ -2140,6 +2158,7 @@ class GridDock(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self._needs_rebuild = True
 
         # show: TV scan-line expand from connected edge
         self._show_anim = QPropertyAnimation(self, b"geometry", self)
@@ -2298,6 +2317,7 @@ class GridDock(QWidget):
             # Move to front so it stays at position 0
             apps.insert(0, apps.pop(app_idx))
         save_config(self.group.controller.cfg)
+        self._needs_rebuild = True
         self.rebuild()
 
     def _toggle_collapse(self):
@@ -2513,7 +2533,12 @@ class GridDock(QWidget):
         btn.customContextMenuRequested.connect(show_menu)
         return btn
 
+    def rebuild_if_needed(self):
+        if self._needs_rebuild:
+            self.rebuild()
+
     def rebuild(self):
+        self._needs_rebuild = False
         self._clear_grid()
         cols = max(1, int(self.group.controller.cfg["columns"]))
         sz = self.group.controller.cfg["icon_size"]
@@ -2646,6 +2671,7 @@ class GridDock(QWidget):
                     "path": vals["url"],
                 })
                 save_config(ctrl.cfg)
+                self._needs_rebuild = True
                 self.rebuild()
 
     def _add_widget(self, kind: str):
@@ -2660,6 +2686,7 @@ class GridDock(QWidget):
             "path": f"__widget:{kind}__",
         })
         save_config(self.group.controller.cfg)
+        self._needs_rebuild = True
         self.rebuild()
 
     def _change_icon(self, app: dict):
@@ -2672,6 +2699,7 @@ class GridDock(QWidget):
         if path:
             app["icon"] = path
             save_config(self.group.controller.cfg)
+            self._needs_rebuild = True
             self.rebuild()
 
 
@@ -2687,6 +2715,7 @@ class DockGroup:
         self.handle = Handle(self)
         self.docks = [GridDock(self, i) for i in range(n)]
         self.connector = LineConnector()
+        self._show_pending = False
 
         self._place_handle()
         self.handle.show()
@@ -2734,7 +2763,7 @@ class DockGroup:
     # --- show / hide ---
     def _show_all_docks(self, animated: bool = True):
         for dock in self.docks:
-            dock.rebuild()
+            dock.rebuild_if_needed()
             dock.update_edit_mode()
 
         card_hints = [dock.card.sizeHint() for dock in self.docks]
@@ -2775,10 +2804,13 @@ class DockGroup:
             d._hiding = False
         if any(d.isVisible() and not d._hiding for d in self.docks) and not hiding:
             return
+        if self._show_pending and not hiding:
+            return
+        self._show_pending = True
 
         # Phase 1 — rebuild docks so sizes are correct, compute positions, resolve overlaps
         for dock in self.docks:
-            dock.rebuild()
+            dock.rebuild_if_needed()
             dock.update_edit_mode()
         # card.sizeHint() is reliable for child widgets even when the parent window is hidden
         card_hints = [dock.card.sizeHint() for dock in self.docks]
@@ -2812,6 +2844,7 @@ class DockGroup:
 
         # Phase 3 — TV-effect reveal each dock from its connected edge outward
         def _reveal():
+            self._show_pending = False
             for dock, pos, edge in zip(self.docks, positions, edges):
                 dock.show_animated(pos, edge)
         QTimer.singleShot(220, _reveal)
@@ -2833,6 +2866,7 @@ class DockGroup:
 
     def _hide_all(self):
         self._leave_time = None
+        self._show_pending = False
         for dock in self.docks:
             dock.hide_animated()
         # let docks shrink first, then retract the connector lines back to handle
@@ -2900,6 +2934,7 @@ class DockGroup:
             docks[dock_index]["apps"].append({"name": display_name(path), "path": path})
         save_config(self.controller.cfg)
         for dock in self.docks:
+            dock._needs_rebuild = True
             dock.rebuild()
 
     def remove_app(self, dock_index: int, path: str):
@@ -2910,6 +2945,7 @@ class DockGroup:
             ]
         save_config(self.controller.cfg)
         for dock in self.docks:
+            dock._needs_rebuild = True
             dock.rebuild()
 
 
@@ -2925,6 +2961,11 @@ class Controller:
         self.timer = QTimer()
         self.timer.timeout.connect(self._tick)
         self.timer.start(120)
+
+        self._start_time = time.monotonic()
+        self._maint_timer = QTimer()
+        self._maint_timer.timeout.connect(self._maintenance)
+        self._maint_timer.start(5 * 60 * 1000)
 
         self._build_tray()
 
@@ -2960,6 +3001,33 @@ class Controller:
             ctypes.windll.user32.UnregisterHotKey(None, _HOTKEY_ID)
         except Exception:
             pass
+
+    def _maintenance(self):
+        import gc
+        gc.collect()
+        try:
+            h = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetProcessWorkingSetSize(
+                h, ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+        except Exception:
+            pass
+        if time.monotonic() - self._start_time > 1800 and not self._dialog_open:
+            self._silent_restart()
+
+    def _silent_restart(self):
+        for g in self.groups:
+            g._hide_all()
+        QTimer.singleShot(300, self._do_restart)
+
+    def _do_restart(self):
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.abspath(sys.argv[0])],
+                creationflags=0x08000000,
+            )
+        except Exception:
+            return
+        self.app.quit()
 
     # --- edit mode ---
     def toggle_edit_mode(self, active: bool):
@@ -3086,6 +3154,9 @@ class Controller:
         self._act_startup.toggled.connect(_set_startup)
         m.addAction(self._act_startup)
         m.addSeparator()
+        a_restart = QAction("Restart", m)
+        a_restart.triggered.connect(self._silent_restart)
+        m.addAction(a_restart)
         a_quit = QAction("Quit", m)
         a_quit.triggered.connect(self.app.quit)
         m.addAction(a_quit)
